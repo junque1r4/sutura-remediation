@@ -1,0 +1,16 @@
+# The base image is passed explicitly (--build-arg BASE_IMAGE=...) and never
+# defaults to a mutable :latest tag, so a build can't silently pull an
+# unrelated public image. Local: the sutura/sandbox-base you just built;
+# CI: the same-commit ACR tag.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+# Node 20 + pnpm + yarn classic.
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+ && apt-get update && apt-get install -y --no-install-recommends nodejs \
+ && rm -rf /var/lib/apt/lists/* \
+ && npm install -g pnpm@9 yarn@1.22.22 \
+ && npm cache clean --force
+
+WORKDIR /work
+CMD ["sleep", "infinity"]

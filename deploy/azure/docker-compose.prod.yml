@@ -1,0 +1,190 @@
+# =============================================================================
+# Sutura -- Azure production compose (single Linux VM)
+#
+# Differences from the root docker-compose.yml (the local/dev stack):
+#   * dashboard + backend are PULLED from Azure Container Registry (no build:),
+#     tagged ${IMAGE_TAG}. CI builds & pushes them; the VM only pulls.
+#   * No host port bindings on dashboard/backend -- they are reachable only on
+#     the internal compose network. Only Caddy publishes 80/443 to the host.
+#   * backend runs hardened: NODE_ENV=production + SANDBOX_RUNTIME=runsc (gVisor)
+#     + DOCKER_SOCKET_PROXY_URL, so the sandbox production guard is satisfied.
+#   * A caddy reverse proxy terminates TLS and routes the two public hostnames.
+#
+# Required env (rendered into /opt/sutura/.env by deploy.sh from Key Vault):
+#   ACR_LOGIN_SERVER, IMAGE_TAG, APP_DOMAIN, API_DOMAIN, ACME_EMAIL,
+#   POSTGRES_PASSWORD, REDIS_PASSWORD, JWT_SECRET, INTEGRATION_ENCRYPTION_KEY
+#   plus the external API keys / GitHub App / webhook secrets the app uses.
+# =============================================================================
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    env_file: .env
+    environment:
+      # Consumed by the Caddyfile via {$VAR} substitution.
+      - APP_DOMAIN=${APP_DOMAIN:?set APP_DOMAIN in .env}
+      - API_DOMAIN=${API_DOMAIN:?set API_DOMAIN in .env}
+      - ACME_EMAIL=${ACME_EMAIL:?set ACME_EMAIL in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      dashboard:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  dashboard:
+    image: ${ACR_LOGIN_SERVER:?set ACR_LOGIN_SERVER in .env}/sutura-dashboard:${IMAGE_TAG:?set IMAGE_TAG in .env}
+    # NEXT_PUBLIC_BACKEND_URL is baked into this image at BUILD time by CI
+    # (--build-arg NEXT_PUBLIC_BACKEND_URL=https://${API_DOMAIN}); it cannot be
+    # changed here at runtime.
+    env_file: .env
+    environment:
+      - HOSTNAME=0.0.0.0
+      - NODE_ENV=production
+      - BACKEND_URL=http://backend:3001
+      - DATABASE_URL=postgres://sutura:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/sutura
+      - REDIS_URL=redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET required}
+      - INTEGRATION_ENCRYPTION_KEY=${INTEGRATION_ENCRYPTION_KEY:?Set INTEGRATION_ENCRYPTION_KEY in .env}
+      # Public dashboard origin, used for password-reset / invite email links.
+      - APP_URL=https://${APP_DOMAIN}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  backend:
+    image: ${ACR_LOGIN_SERVER:?set ACR_LOGIN_SERVER in .env}/sutura-backend:${IMAGE_TAG:?set IMAGE_TAG in .env}
+    env_file: .env
+    environment:
+      # Production: the sandbox guard refuses to boot unless runsc + a socket
+      # proxy are configured. The VM has gVisor installed (cloud-init) and runs
+      # the docker-socket-proxy service below.
+      - NODE_ENV=production
+      - DATABASE_URL=postgres://sutura:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/sutura
+      - REDIS_URL=redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379
+      # CORS allow-list is driven by DASHBOARD_URL -- it MUST be the public
+      # dashboard origin the browser sends as Origin, not an internal hostname.
+      - DASHBOARD_URL=https://${APP_DOMAIN:?set APP_DOMAIN in .env}
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET required}
+      - INTEGRATION_ENCRYPTION_KEY=${INTEGRATION_ENCRYPTION_KEY:?Set INTEGRATION_ENCRYPTION_KEY in .env}
+      # --- Sandbox hardening (validated-fix worker) ---
+      - SANDBOX_RUNTIME=runsc
+      - DOCKER_SOCKET_PROXY_URL=tcp://docker-socket-proxy:2375
+      - DOCKER_HOST=tcp://docker-socket-proxy:2375
+      - SANDBOX_ENABLE_EGRESS=false
+      - SANDBOX_EGRESS_NETWORK=no-egress-net
+      # Sandbox sizing/timeouts mirror the dev compose defaults; tune per VM size.
+      - SUTURA_INSTALL_TIMEOUT_MS=${SUTURA_INSTALL_TIMEOUT_MS:-600000}
+      - SUTURA_TEST_TIMEOUT_MS=${SUTURA_TEST_TIMEOUT_MS:-420000}
+      - SUTURA_GRADER_TIMEOUT_MS=${SUTURA_GRADER_TIMEOUT_MS:-900000}
+      - SANDBOX_HOME_TMPFS_MB=${SANDBOX_HOME_TMPFS_MB:-4096}
+      - SUTURA_SANDBOX_MEMORY_BYTES=${SUTURA_SANDBOX_MEMORY_BYTES:-6442450944}
+      - SANDBOX_CACHE_TTL_DAYS=${SANDBOX_CACHE_TTL_DAYS:-14}
+      # Optional feature flags / scanner sync (see .env.production.template).
+      - SUTURA_VALIDATED_FIX_DISABLED=${SUTURA_VALIDATED_FIX_DISABLED:-}
+      - SUTURA_VERIFY_DISABLED=${SUTURA_VERIFY_DISABLED:-}
+      - SUTURA_PREWARM_DISABLED=${SUTURA_PREWARM_DISABLED:-}
+      - SCANNER_SYNC_ENABLED=${SCANNER_SYNC_ENABLED:-false}
+      - SCANNER_SYNC_INTERVAL_MS=${SCANNER_SYNC_INTERVAL_MS:-900000}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      docker-socket-proxy:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    restart: unless-stopped
+
+  docker-socket-proxy:
+    # Least-privilege gateway in front of the host Docker daemon. Identical
+    # allow-list to the dev compose: only what the validated-fix pipeline needs.
+    image: tecnativa/docker-socket-proxy:0.3.0
+    environment:
+      CONTAINERS: 1
+      IMAGES: 1
+      NETWORKS: 1
+      EXEC: 1
+      POST: 1
+      VOLUMES: 1
+      SECRETS: 0
+      SWARM: 0
+      SERVICES: 0
+      CONFIGS: 0
+      NODES: 0
+      TASKS: 0
+      PLUGINS: 0
+      SYSTEM: 0
+      INFO: 0
+      AUTH: 0
+      BUILD: 0
+      COMMIT: 0
+      DISTRIBUTION: 0
+      SESSION: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:2375/_ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sutura
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: sutura
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sutura -d sutura"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
+  caddy-data:
+  caddy-config:

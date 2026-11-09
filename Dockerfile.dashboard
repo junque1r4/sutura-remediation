@@ -1,0 +1,40 @@
+FROM node:20-alpine AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+COPY apps/dashboard/package.json apps/dashboard/
+COPY packages/common/package.json packages/common/
+RUN npm ci --workspace=apps/dashboard --workspace=packages/common
+
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=deps /app/apps/dashboard/node_modules ./apps/dashboard/node_modules
+COPY package.json package-lock.json tsconfig.json ./
+COPY apps/dashboard/ apps/dashboard/
+COPY packages/common/ packages/common/
+ENV NEXT_TELEMETRY_DISABLED=1
+# Browser-reachable backend origin, baked into the client bundle at build time.
+# Supplied by docker-compose via build.args (NEXT_PUBLIC_BACKEND_URL); falls back
+# to localhost only for bare `docker build` invocations without the arg.
+ARG NEXT_PUBLIC_BACKEND_URL=http://localhost:3001
+ENV NEXT_PUBLIC_BACKEND_URL=$NEXT_PUBLIC_BACKEND_URL
+# Selects the persisted DB findings list over the live scanner fetch. Supplied
+# by docker-compose via build.args; defaults to false for bare `docker build`.
+ARG NEXT_PUBLIC_FINDINGS_FROM_DB=false
+ENV NEXT_PUBLIC_FINDINGS_FROM_DB=$NEXT_PUBLIC_FINDINGS_FROM_DB
+RUN npm run build --workspace=apps/dashboard
+
+FROM node:20-alpine AS runner
+WORKDIR /app
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+COPY --from=builder /app/apps/dashboard/.next/standalone ./
+COPY --from=builder /app/apps/dashboard/.next/static ./apps/dashboard/.next/static
+COPY --from=builder /app/apps/dashboard/public ./apps/dashboard/public
+EXPOSE 3000
+ENV PORT=3000
+# Next.js standalone binds to HOSTNAME; default to all interfaces so the
+# container loopback healthcheck and port mapping both work (compose sets
+# this too, but bake it so bare `docker run` behaves the same).
+ENV HOSTNAME=0.0.0.0
+CMD ["node", "apps/dashboard/server.js"]

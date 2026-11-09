@@ -1,0 +1,20 @@
+{
+  "name": "@sutura/vector-indexer",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/index.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest",
+    "lint": "eslint src/"
+  },
+  "dependencies": {
+    "@octokit/rest": "^19.0.13",
+    "@pinecone-database/pinecone": "^4.0.0",
+    "@sutura/common": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.12"
+  }
+}

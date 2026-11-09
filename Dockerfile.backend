@@ -1,0 +1,53 @@
+FROM node:20-alpine AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+COPY packages/backend/package.json packages/backend/
+COPY packages/common/package.json packages/common/
+COPY packages/fix-engine/package.json packages/fix-engine/
+COPY packages/sandbox-runner/package.json packages/sandbox-runner/
+COPY packages/vector-indexer/package.json packages/vector-indexer/
+RUN npm ci --workspace=packages/backend --workspace=packages/common --workspace=packages/fix-engine --workspace=packages/sandbox-runner --workspace=packages/vector-indexer
+
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=deps /app/packages/backend/node_modules ./packages/backend/node_modules
+COPY --from=deps /app/packages/fix-engine/node_modules ./packages/fix-engine/node_modules
+COPY --from=deps /app/packages/vector-indexer/node_modules ./packages/vector-indexer/node_modules
+# sandbox-runner has no per-package node_modules -- all its deps (dockerode,
+# tar-stream, type packages) hoist to the root node_modules.
+COPY package.json package-lock.json tsconfig.json ./
+COPY packages/common/ packages/common/
+COPY packages/vector-indexer/ packages/vector-indexer/
+COPY packages/sandbox-runner/ packages/sandbox-runner/
+COPY packages/fix-engine/ packages/fix-engine/
+COPY packages/backend/ packages/backend/
+RUN npm run build --workspace=packages/common --workspace=packages/vector-indexer --workspace=packages/sandbox-runner --workspace=packages/fix-engine --workspace=packages/backend
+RUN sed -i 's|"main": "src/index.ts"|"main": "dist/index.js"|' \
+    packages/common/package.json \
+    packages/fix-engine/package.json \
+    packages/sandbox-runner/package.json \
+    packages/vector-indexer/package.json
+
+FROM node:20-alpine AS runner
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=deps /app/packages/backend/node_modules ./packages/backend/node_modules
+COPY --from=deps /app/packages/fix-engine/node_modules ./packages/fix-engine/node_modules
+COPY --from=deps /app/packages/vector-indexer/node_modules ./packages/vector-indexer/node_modules
+COPY --from=builder /app/packages/backend/dist ./packages/backend/dist
+COPY --from=builder /app/packages/backend/package.json ./packages/backend/package.json
+# tsc doesn't emit .sql; copy migrations alongside the compiled migrate.js.
+COPY --from=builder /app/packages/backend/src/db/migrations ./packages/backend/dist/db/migrations
+COPY --from=builder /app/packages/common/dist ./packages/common/dist
+COPY --from=builder /app/packages/common/package.json ./packages/common/package.json
+COPY --from=builder /app/packages/fix-engine/dist ./packages/fix-engine/dist
+COPY --from=builder /app/packages/fix-engine/package.json ./packages/fix-engine/package.json
+COPY --from=builder /app/packages/sandbox-runner/dist ./packages/sandbox-runner/dist
+COPY --from=builder /app/packages/sandbox-runner/package.json ./packages/sandbox-runner/package.json
+COPY --from=builder /app/packages/vector-indexer/dist ./packages/vector-indexer/dist
+COPY --from=builder /app/packages/vector-indexer/package.json ./packages/vector-indexer/package.json
+COPY package.json ./
+EXPOSE 3001
+CMD ["node", "packages/backend/dist/index.js"]

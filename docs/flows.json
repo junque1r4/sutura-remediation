@@ -1,0 +1,599 @@
+{
+  "meta": {
+    "project": "Sutura",
+    "tagline": "VulnFix Platform — continuous vulnerability remediation",
+    "generated": "2026-05-12",
+    "sourceCommit": "a07bb50",
+    "repoLayout": {
+      "apps/dashboard": "Next.js dashboard (UI + same-origin API proxies)",
+      "packages/backend": "Express API + BullMQ workers + Supabase access",
+      "packages/fix-engine": "Validated-fix pipeline + agentic generator + CI watcher",
+      "packages/vector-indexer": "Repo chunker + Voyage embedder + Pinecone store",
+      "packages/sandbox-runner": "Docker-backed sandbox for patch/install/test/scan",
+      "packages/common": "Shared types and limits"
+    }
+  },
+  "actors": [
+    { "id": "user", "label": "User", "kind": "user" },
+    { "id": "scanner", "label": "Aikido / Snyk", "kind": "external" },
+    { "id": "github", "label": "GitHub", "kind": "external" },
+    { "id": "anthropic", "label": "Claude API", "kind": "external" },
+    { "id": "voyage", "label": "Voyage AI", "kind": "external" },
+    { "id": "pinecone", "label": "Pinecone", "kind": "external" },
+    { "id": "dashboard", "label": "Dashboard (Next.js)", "kind": "dashboard" },
+    { "id": "backend", "label": "Backend (Express)", "kind": "backend" },
+    { "id": "db", "label": "Supabase (Postgres)", "kind": "external" },
+    { "id": "redis", "label": "Redis (BullMQ)", "kind": "external" },
+    { "id": "validation_worker", "label": "Validation Worker", "kind": "worker" },
+    { "id": "index_worker", "label": "Index Worker", "kind": "worker" },
+    { "id": "sandbox", "label": "Docker Sandbox", "kind": "worker" }
+  ],
+  "flows": [
+    {
+      "id": "onboarding",
+      "name": "Onboarding & Integration Setup",
+      "category": "Onboarding",
+      "summary": "Operator connects a scanner, installs the GitHub App, supplies a Claude key, picks repos, and (optionally) writes custom prompts. Each integration's credentials live in encrypted cookies on the dashboard or in the org's settings_json row in Supabase.",
+      "trigger": "User opens /onboarding (or /settings to add an integration later)",
+      "actors": ["user", "dashboard", "github", "scanner", "anthropic", "backend", "db"],
+      "steps": [
+        {
+          "from": "user",
+          "to": "dashboard",
+          "action": "Pick scanner (Aikido / Snyk) and submit API credential",
+          "ref": "apps/dashboard/src/app/api/aikido/connect"
+        },
+        {
+          "from": "dashboard",
+          "to": "scanner",
+          "action": "Validate credential",
+          "detail": "Token stored as encrypted cookie; never sent to backend except as job payload"
+        },
+        {
+          "from": "user",
+          "to": "dashboard",
+          "action": "Click 'Connect GitHub App'",
+          "ref": "apps/dashboard/src/app/api/github/install/route.ts"
+        },
+        {
+          "from": "dashboard",
+          "to": "github",
+          "action": "Redirect to GitHub App install URL (or recover existing install)"
+        },
+        {
+          "from": "github",
+          "to": "dashboard",
+          "action": "Callback with installation_id",
+          "ref": "apps/dashboard/src/app/api/github/callback"
+        },
+        {
+          "from": "dashboard",
+          "to": "db",
+          "action": "Save installation_id + account login on organizations.settings_json.integrations.github"
+        },
+        {
+          "from": "user",
+          "to": "dashboard",
+          "action": "Submit Claude API key",
+          "ref": "apps/dashboard/src/app/api/anthropic/connect"
+        },
+        { "from": "dashboard", "to": "anthropic", "action": "Validate key (list models)" },
+        {
+          "from": "user",
+          "to": "dashboard",
+          "action": "Select repos to monitor + write custom prompts (env, conventions, testing, business)"
+        },
+        {
+          "from": "dashboard",
+          "to": "backend",
+          "action": "PATCH /api/org/prompts and /api/org/settings"
+        },
+        {
+          "from": "backend",
+          "to": "db",
+          "action": "Persist organizations.custom_prompts_json and settings_json"
+        }
+      ],
+      "outputs": [
+        "Encrypted cookies: aikido_connection, snyk_connection, anthropic_connection",
+        "organizations row populated with github installation + custom prompts",
+        "Dashboard is wired to trigger fixes and ingest scanner data"
+      ],
+      "failureModes": [
+        "GitHub App slug missing in env → install button errors",
+        "Multi-installation orgs not auto-recovered; user must pick install explicitly",
+        "Bad scanner credential → cookie set but later API calls 401"
+      ],
+      "references": [
+        {
+          "label": "Dashboard onboarding page",
+          "path": "apps/dashboard/src/app/onboarding/page.tsx"
+        },
+        {
+          "label": "GitHub install route",
+          "path": "apps/dashboard/src/app/api/github/install/route.ts"
+        },
+        { "label": "Aikido connect route", "path": "apps/dashboard/src/app/api/aikido/connect" },
+        {
+          "label": "Anthropic connect route",
+          "path": "apps/dashboard/src/app/api/anthropic/connect/route.ts"
+        }
+      ]
+    },
+    {
+      "id": "ingestion-webhook",
+      "name": "Scanner Webhook Ingestion",
+      "category": "Ingestion",
+      "summary": "Aikido and Snyk push findings via HMAC-signed webhooks. The backend verifies the signature, normalizes the payload through the scanner adapter, upserts on (org_id, scanner_source, external_id), and writes an audit-log entry.",
+      "trigger": "Aikido/Snyk POSTs a new-issue webhook",
+      "actors": ["scanner", "backend", "db"],
+      "steps": [
+        {
+          "from": "scanner",
+          "to": "backend",
+          "action": "POST /webhooks/aikido (or /webhooks/snyk) with X-*-Signature header",
+          "ref": "packages/backend/src/routes/webhooks.ts"
+        },
+        {
+          "from": "backend",
+          "to": "backend",
+          "action": "verifyHmac(body, signature, secret) with timingSafeEqual"
+        },
+        {
+          "from": "backend",
+          "to": "backend",
+          "action": "AikidoAdapter.normalizeWebhookPayload → NormalizedFinding[]"
+        },
+        {
+          "from": "backend",
+          "to": "db",
+          "action": "upsertFindings(orgId, findings) — dedupes on (org_id, scanner_source, external_id)"
+        },
+        {
+          "from": "backend",
+          "to": "db",
+          "action": "logAction(webhook.aikido.received, { count })"
+        },
+        { "from": "backend", "to": "scanner", "action": "200 { received: true, count }" }
+      ],
+      "outputs": [
+        "New rows (or no-op upserts) in findings table",
+        "Audit log entry per webhook batch"
+      ],
+      "failureModes": [
+        "Invalid HMAC → 401",
+        "Org header missing → falls back to 'default' org id",
+        "Adapter normalization gap → finding silently shaped with low confidence"
+      ],
+      "references": [
+        { "label": "Webhook routes", "path": "packages/backend/src/routes/webhooks.ts" },
+        {
+          "label": "Aikido adapter",
+          "path": "packages/backend/src/adapters/scanners/aikido/aikido-adapter.ts"
+        }
+      ]
+    },
+    {
+      "id": "repository-indexing",
+      "name": "Repository Indexing (RAG)",
+      "category": "Indexing",
+      "summary": "On demand or per repo connect, the indexer clones the repo, splits sources by function/line boundary, embeds chunks with Voyage's voyage-code-3, and upserts them into a Pinecone namespace shaped {orgId}/{repo}/{branch}. The validated-fix pipeline later queries this namespace for context chunks.",
+      "trigger": "POST /api/repositories/:repo/index from dashboard, or reconnect flow",
+      "actors": [
+        "dashboard",
+        "backend",
+        "redis",
+        "index_worker",
+        "github",
+        "voyage",
+        "pinecone",
+        "db"
+      ],
+      "steps": [
+        { "from": "dashboard", "to": "backend", "action": "POST /api/repositories/:repo/index" },
+        {
+          "from": "backend",
+          "to": "redis",
+          "action": "enqueueIndexJob({ repo, branch, orgId, githubToken })"
+        },
+        { "from": "index_worker", "to": "redis", "action": "Pulls job from index-queue" },
+        {
+          "from": "index_worker",
+          "to": "github",
+          "action": "Fetch source tree / tarball via Octokit"
+        },
+        {
+          "from": "index_worker",
+          "to": "index_worker",
+          "action": "Filter to .ts/.tsx/.js/.py/.go/.java/.rs/.rb; skip node_modules, dist, lockfiles"
+        },
+        {
+          "from": "index_worker",
+          "to": "index_worker",
+          "action": "Chunk by function/class boundaries, fallback ~100-line windows with overlap"
+        },
+        {
+          "from": "index_worker",
+          "to": "voyage",
+          "action": "Batch-embed chunks (voyage-code-3, up to 128/call)"
+        },
+        {
+          "from": "index_worker",
+          "to": "pinecone",
+          "action": "upsertVectors(namespace={orgId}/{repo}/{branch}, vectors)"
+        },
+        { "from": "index_worker", "to": "db", "action": "upsert codebase_indices row + audit log" }
+      ],
+      "outputs": [
+        "Pinecone namespace populated with embeddings + metadata",
+        "codebase_indices row with chunk count + last-indexed timestamp"
+      ],
+      "failureModes": [
+        "Voyage rate limit → batch retries",
+        "Pinecone quota → partial upsert, namespace left in mixed state",
+        "Repo too large → chunk explosion; mitigated by file-type filter"
+      ],
+      "references": [
+        { "label": "Vector indexer package", "path": "packages/vector-indexer/src" },
+        { "label": "Index worker", "path": "packages/backend/src/queue/workers/index-worker.ts" }
+      ]
+    },
+    {
+      "id": "manual-analyze",
+      "name": "On-Demand Finding Analysis",
+      "category": "Manual Actions",
+      "summary": "From a finding detail page the user can run a one-shot analysis pass. The dashboard calls Claude with the finding + repo context and returns a markdown report (Recommended Fix, Proposed Diff). The report is later prepended to the fix prompt as 'Prior Analysis'.",
+      "trigger": "User clicks 'Analyze' on a finding detail page",
+      "actors": ["user", "dashboard", "anthropic", "pinecone", "github"],
+      "steps": [
+        {
+          "from": "user",
+          "to": "dashboard",
+          "action": "POST /api/findings/analyze with findingId",
+          "ref": "apps/dashboard/src/app/api/findings/analyze/route.ts"
+        },
+        {
+          "from": "dashboard",
+          "to": "pinecone",
+          "action": "Query top-k chunks for the affected file/symbol"
+        },
+        { "from": "dashboard", "to": "github", "action": "Fetch raw vulnerable file via Octokit" },
+        {
+          "from": "dashboard",
+          "to": "anthropic",
+          "action": "Run analysis prompt (Claude) — split input/output cached for cost UI"
+        },
+        {
+          "from": "dashboard",
+          "to": "user",
+          "action": "Stream markdown report back to the finding page"
+        }
+      ],
+      "outputs": [
+        "Markdown analysis stored with the finding (used as priorAnalysis on next fix trigger)",
+        "Token-usage row recorded for analysis pricing"
+      ],
+      "failureModes": [
+        "Pinecone namespace missing → analysis runs without RAG context",
+        "Anthropic key invalid → 401, surfaced in UI",
+        "Repo not indexed → user prompted to index first"
+      ],
+      "references": [
+        { "label": "Analyze route", "path": "apps/dashboard/src/app/api/findings/analyze/route.ts" }
+      ]
+    },
+    {
+      "id": "trigger-fix",
+      "name": "User Triggers a Validated Fix",
+      "category": "Manual Actions",
+      "summary": "The dashboard proxies the trigger request to the backend, attaching the user's Aikido and Anthropic credentials from encrypted cookies plus the latest prior-analysis markdown. The backend resolves a service JWT, mints a short-lived GitHub installation token, and enqueues a validation job.",
+      "trigger": "User clicks 'Generate Fix' on a finding (or 'Retry' on a failed attempt)",
+      "actors": ["user", "dashboard", "backend", "redis", "db"],
+      "steps": [
+        {
+          "from": "user",
+          "to": "dashboard",
+          "action": "POST /api/findings/[id]/validated-fix/trigger { targetBranch?, reviewers?, maxAttempts?, priorAnalysis? }",
+          "ref": "apps/dashboard/src/app/api/findings/[id]/validated-fix/trigger/route.ts"
+        },
+        {
+          "from": "dashboard",
+          "to": "dashboard",
+          "action": "Decrypt aikido_connection + anthropic_connection cookies"
+        },
+        {
+          "from": "dashboard",
+          "to": "backend",
+          "action": "POST /api/findings/:id/validated-fix with credentials in body + service JWT"
+        },
+        { "from": "backend", "to": "db", "action": "Load finding, organization, custom prompts" },
+        {
+          "from": "backend",
+          "to": "redis",
+          "action": "validationQueue.add({ findingId, orgId, aikidoApiKey, anthropicApiKey, priorAnalysis, ... })"
+        },
+        { "from": "backend", "to": "dashboard", "action": "202 { jobId, attemptId }" }
+      ],
+      "outputs": [
+        "BullMQ job on validation-queue",
+        "findings.status set to 'fixing' by the worker on dequeue"
+      ],
+      "failureModes": [
+        "Kill switch enabled → 'validated_fix.killed' audit entry, no job enqueued",
+        "Org has no GitHub App install → job still enqueued; pipeline will fail at PR step",
+        "Aikido/Anthropic cookies missing → pipeline falls back to env keys or OSS scanners"
+      ],
+      "references": [
+        {
+          "label": "Dashboard trigger proxy",
+          "path": "apps/dashboard/src/app/api/findings/[id]/validated-fix/trigger/route.ts"
+        },
+        {
+          "label": "Backend validated-fix route",
+          "path": "packages/backend/src/routes/validated-fix.ts"
+        }
+      ]
+    },
+    {
+      "id": "validated-fix-pipeline",
+      "name": "Validated-Fix Pipeline (one attempt)",
+      "category": "Fix Pipeline",
+      "summary": "The validation worker drives a sandboxed loop per finding: fetch repo tarball, then for each attempt extract a fresh workspace, run the agentic generator (Claude + tool-use against the sandbox), apply the patch, generate tests, install, run tests, re-scan, open the PR, and wait for CI. Each stage failure is recorded; on retry the next iteration sees the failure output as feedback.",
+      "trigger": "Validation worker pulls a job from validation-queue",
+      "actors": ["validation_worker", "github", "sandbox", "anthropic", "db", "backend"],
+      "steps": [
+        {
+          "from": "validation_worker",
+          "to": "db",
+          "action": "Load finding + org; update finding.status = 'fixing'",
+          "ref": "packages/backend/src/queue/workers/validation-worker.ts"
+        },
+        {
+          "from": "validation_worker",
+          "to": "github",
+          "action": "Mint installation token via GitHub App JWT"
+        },
+        {
+          "from": "validation_worker",
+          "to": "validation_worker",
+          "action": "triage(finding) — skip if not auto-fixable",
+          "ref": "packages/fix-engine/src/pipeline/triage.ts"
+        },
+        {
+          "from": "validation_worker",
+          "to": "github",
+          "action": "fetchRepoTarball(repo, branch, token) — resolves default branch when none given"
+        },
+        {
+          "from": "validation_worker",
+          "to": "sandbox",
+          "action": "createWorkspace(tarball) — fresh extraction per attempt",
+          "detail": "Prevents prior rejected patch from poisoning next git apply"
+        },
+        {
+          "from": "validation_worker",
+          "to": "db",
+          "action": "Insert fix_attempts row (status='running', attempt_number, parent_attempt_id)"
+        },
+        {
+          "from": "validation_worker",
+          "to": "anthropic",
+          "action": "generateFixAgentic — Claude with sandbox tool-use, prior analysis prepended, prior-failure feedback appended",
+          "ref": "packages/fix-engine/src/pipeline/generator.ts"
+        },
+        {
+          "from": "validation_worker",
+          "to": "sandbox",
+          "action": "applyPatch(workspace, diff) — record patch sandbox-log"
+        },
+        {
+          "from": "validation_worker",
+          "to": "anthropic",
+          "action": "runTestGenerationAgent — Claude proposes test file(s) targeting the fix",
+          "ref": "packages/fix-engine/src/pipeline/validated/test-generator.ts"
+        },
+        {
+          "from": "validation_worker",
+          "to": "sandbox",
+          "action": "install() — run package manager install in the sandbox"
+        },
+        {
+          "from": "validation_worker",
+          "to": "sandbox",
+          "action": "runTests(paths) — execute generated tests"
+        },
+        {
+          "from": "validation_worker",
+          "to": "sandbox",
+          "action": "runSecurityScan(finding, workspace) — Aikido or OSS fallback; verdict ∈ resolved | still-vulnerable | inconclusive"
+        },
+        {
+          "from": "validation_worker",
+          "to": "db",
+          "action": "Persist validation status BEFORE PR step (so UI shows 'validated' even if PR fails)"
+        },
+        {
+          "from": "validation_worker",
+          "to": "github",
+          "action": "submitMultiFile — create branch sutura/fix-{findingId}, write fix + test files, open PR"
+        },
+        {
+          "from": "validation_worker",
+          "to": "github",
+          "action": "awaitCiVerdict — poll check_runs on PR head SHA up to ciTimeoutMs (default 10 min)",
+          "ref": "packages/fix-engine/src/pipeline/ci-watcher.ts"
+        },
+        {
+          "from": "validation_worker",
+          "to": "db",
+          "action": "Update fix_attempts with ci_check_status + ci_failure_logs; mark succeeded / failed / exhausted"
+        },
+        {
+          "from": "validation_worker",
+          "to": "db",
+          "action": "logAction(validated_fix.opened | validated_fix.failed)"
+        }
+      ],
+      "outputs": [
+        "fix_attempts row per attempt with diff, test files, sandbox logs, scan output, PR URL, CI verdict",
+        "Successful attempt → finding.status='fixed', PR open on GitHub",
+        "Exhausted (all attempts failed) → finding.status='failed'"
+      ],
+      "failureModes": [
+        "Patch rejected → next attempt restarts from clean tarball with the reject text in feedback",
+        "Install / test failure → recorded; retry uses tail of stdout+stderr as feedback",
+        "Rescan still vulnerable → attempt failed even though tests passed",
+        "CI failure → ci_failure_logs (head+tail, ≤64KB) become next iteration's feedback",
+        "Sandbox image missing → fail-fast with operator-actionable warning",
+        "Kill switch ON → pipeline aborts with reason='kill_switch' before any work"
+      ],
+      "references": [
+        {
+          "label": "Pipeline orchestrator",
+          "path": "packages/fix-engine/src/pipeline/validated/orchestrator.ts"
+        },
+        {
+          "label": "Validation worker",
+          "path": "packages/backend/src/queue/workers/validation-worker.ts"
+        },
+        { "label": "CI watcher", "path": "packages/fix-engine/src/pipeline/ci-watcher.ts" },
+        { "label": "Sandbox runner", "path": "packages/sandbox-runner" }
+      ]
+    },
+    {
+      "id": "agentic-loop",
+      "name": "Agentic Fix Loop (retry feedback)",
+      "category": "Agentic Loop",
+      "summary": "When an attempt fails at any stage — patch, install, tests, rescan, or CI — the next iteration of the pipeline starts from a clean workspace but feeds the prior failure stage + output back into the prompt. The generator runs as a tool-using Claude agent so it can read the sandbox before re-emitting the diff.",
+      "trigger": "Previous attempt set lastFailure; attempt counter < maxAttempts (default 3)",
+      "actors": ["validation_worker", "anthropic", "sandbox"],
+      "steps": [
+        {
+          "from": "validation_worker",
+          "to": "validation_worker",
+          "action": "lastFailure = { stage, output (tail 4-16KB) } captured from prior attempt"
+        },
+        {
+          "from": "validation_worker",
+          "to": "sandbox",
+          "action": "Fresh workspace extraction from same tarball"
+        },
+        {
+          "from": "validation_worker",
+          "to": "anthropic",
+          "action": "Prompt prepend: Prior Analysis (cap 12KB tail); append: 'Previous attempt #N failed at stage X' + output tail"
+        },
+        {
+          "from": "anthropic",
+          "to": "sandbox",
+          "action": "Tool calls: read files, run probes, list directories — agent inspects current state",
+          "ref": "packages/fix-engine/src/agent/sandbox-tools.ts"
+        },
+        {
+          "from": "anthropic",
+          "to": "validation_worker",
+          "action": "Emit corrected unified diff (+ optional reasoning)"
+        },
+        {
+          "from": "validation_worker",
+          "to": "validation_worker",
+          "action": "Loop back into patch → tests → scan → PR → CI"
+        }
+      ],
+      "outputs": [
+        "Chained fix_attempts rows linked by parent_attempt_id",
+        "On exhaustion, last row marked status='exhausted'; finding.status='failed'"
+      ],
+      "failureModes": [
+        "Generator emits no diff → recorded as 'no_diff', counts as one attempt",
+        "Agent loops without convergence → maxAttempts is the hard ceiling",
+        "Lock duration is 45 min so CI polling (≤10 min × 3 attempts) fits in one worker lock"
+      ],
+      "references": [
+        { "label": "Agent loop", "path": "packages/fix-engine/src/agent/loop.ts" },
+        { "label": "Sandbox tools", "path": "packages/fix-engine/src/agent/sandbox-tools.ts" },
+        {
+          "label": "Failure-feedback prompt",
+          "path": "packages/fix-engine/src/pipeline/validated/orchestrator.ts"
+        }
+      ]
+    },
+    {
+      "id": "dashboard-reads",
+      "name": "Dashboard Read Paths",
+      "category": "Dashboard Reads",
+      "summary": "All read pages — overview, findings, fix history, repositories, audit log, settings, prompts, analytics, token costs — fetch from the backend via the dashboard's backend-client wrapper. A service-token JWT is generated per request from the configured DEFAULT_ORG_ID.",
+      "trigger": "User navigates to any dashboard page",
+      "actors": ["user", "dashboard", "backend", "db"],
+      "steps": [
+        {
+          "from": "user",
+          "to": "dashboard",
+          "action": "Open page (e.g. /findings, /fixes, /audit-log)"
+        },
+        {
+          "from": "dashboard",
+          "to": "backend",
+          "action": "GET /api/findings | /api/fixes | /api/audit-log | /api/org | /api/repositories with Authorization: Bearer <service-jwt>"
+        },
+        {
+          "from": "backend",
+          "to": "db",
+          "action": "Supabase query with org_id filter (RLS bypass via service key)"
+        },
+        {
+          "from": "backend",
+          "to": "dashboard",
+          "action": "Paginated JSON { data, total, page, pageSize }"
+        },
+        {
+          "from": "dashboard",
+          "to": "user",
+          "action": "Render cards/tables with loading + error states"
+        }
+      ],
+      "outputs": [
+        "Stateless reads; no DB mutation",
+        "Token-costs page joins token_usage rows by operation (analysis vs fix_generation) for split cost UI"
+      ],
+      "failureModes": [
+        "Backend unreachable → page shows offline state",
+        "DEFAULT_ORG_ID misconfigured → 'org not found' on every page"
+      ],
+      "references": [
+        { "label": "Findings route", "path": "packages/backend/src/routes/findings.ts" },
+        { "label": "Fixes route", "path": "packages/backend/src/routes/fixes.ts" },
+        { "label": "Audit-log route", "path": "packages/backend/src/routes/audit-log.ts" },
+        { "label": "Token-usage route", "path": "packages/backend/src/routes/token-usage.ts" }
+      ]
+    },
+    {
+      "id": "audit-log",
+      "name": "Audit Logging",
+      "category": "Cross-cutting",
+      "summary": "Every mutating action — webhook receipt, fix trigger, fix outcome, settings change — writes a row to audit_log with actor, action, resource type/id, and structured metadata. The dashboard's /audit-log page renders this in reverse-chronological order with search.",
+      "trigger": "Any mutating call across backend or workers",
+      "actors": ["backend", "validation_worker", "index_worker", "db"],
+      "steps": [
+        {
+          "from": "backend",
+          "to": "db",
+          "action": "logAction({ org_id, actor, action, resource_type, resource_id?, metadata_json })"
+        },
+        {
+          "from": "validation_worker",
+          "to": "db",
+          "action": "logAction(validated_fix.opened | validated_fix.failed | validated_fix.killed)"
+        },
+        { "from": "backend", "to": "db", "action": "Webhook receipt logs include batch counts" }
+      ],
+      "outputs": ["Append-only audit_log rows surfaced in /audit-log UI"],
+      "failureModes": [
+        "Audit insert errors are swallowed with .catch(() => {}) so failures don't block primary actions"
+      ],
+      "references": [
+        { "label": "Audit-log DB module", "path": "packages/backend/src/db/audit-log.ts" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,213 @@
+services:
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+      args:
+        # Baked into the Next.js client bundle at build time. This MUST be the
+        # backend origin reachable from the user's browser (not an internal
+        # compose hostname). Override per-environment, e.g. https://api.example.com.
+        NEXT_PUBLIC_BACKEND_URL: ${NEXT_PUBLIC_BACKEND_URL:-http://localhost:3001}
+        # When true, the dashboard reads the persisted DB findings list instead
+        # of fetching live from the scanner API. Baked into the client bundle.
+        NEXT_PUBLIC_FINDINGS_FROM_DB: ${NEXT_PUBLIC_FINDINGS_FROM_DB:-false}
+    ports:
+      - "3000:3000"
+    env_file: .env
+    environment:
+      # Next.js standalone binds to HOSTNAME. Without this it binds the
+      # container hostname only, so in-container loopback (healthcheck) fails.
+      - HOSTNAME=0.0.0.0
+      - BACKEND_URL=http://backend:3001
+      - DATABASE_URL=postgres://sutura:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/sutura
+      - REDIS_URL=redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379
+      # The dashboard signs backend tokens server-side (src/lib/auth/backend-token.ts).
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET required}
+      # Encrypts integration (Aikido / Anthropic / Snyk) cookie payloads.
+      # The dashboard fails fast at boot if this is missing or weak in production.
+      # Prefer the new name; fall back to the legacy SNYK_ENCRYPTION_SECRET
+      # during transition (matches lib/encryption-config.ts). If neither is set,
+      # fail fast with a helpful message rather than booting with no key.
+      - INTEGRATION_ENCRYPTION_KEY=${INTEGRATION_ENCRYPTION_KEY:-${SNYK_ENCRYPTION_SECRET:?Set INTEGRATION_ENCRYPTION_KEY (legacy SNYK_ENCRYPTION_SECRET also accepted) in .env}}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    healthcheck:
+      # 127.0.0.1, not localhost: busybox wget resolves localhost to ::1 and
+      # the Next standalone server listens on IPv4 only. The / route 307s to
+      # /login (public); busybox wget follows the redirect and gets 200.
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    ports:
+      - "3001:3001"
+    env_file: .env
+    environment:
+      # The image bakes NODE_ENV=production (Dockerfile.backend), but this
+      # compose stack is the local/dev one and intentionally runs the sandbox
+      # under runc (no gVisor on Docker Desktop/Mac). The sandbox hardening
+      # guard (packages/sandbox-runner/src/sandbox-config.ts) only rejects runc
+      # when NODE_ENV === 'production', so we override it to 'development' here
+      # to keep the documented local runc behavior. Override to 'production'
+      # only on a host that actually has gVisor (runsc) installed.
+      - NODE_ENV=${NODE_ENV:-development}
+      - DATABASE_URL=postgres://sutura:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/sutura
+      - REDIS_URL=redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379
+      - DASHBOARD_URL=http://dashboard:3000
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET required}
+      # Decrypts integration secret fields carried in Redis job payloads; must
+      # match the dashboard's value. Backend fails fast at boot if missing/weak.
+      # Prefer the new name; fall back to the legacy SNYK_ENCRYPTION_SECRET
+      # during transition (matches lib/encryption-config.ts). If neither is set,
+      # fail fast with a helpful message rather than booting with no key.
+      - INTEGRATION_ENCRYPTION_KEY=${INTEGRATION_ENCRYPTION_KEY:-${SNYK_ENCRYPTION_SECRET:?Set INTEGRATION_ENCRYPTION_KEY (legacy SNYK_ENCRYPTION_SECRET also accepted) in .env}}
+      # Set to '1' to make the validated-fix worker fail-fast on every job.
+      - SUTURA_VALIDATED_FIX_DISABLED=${SUTURA_VALIDATED_FIX_DISABLED:-}
+      # Set to '1' to skip the pre-fix exploitability verification gate.
+      - SUTURA_VERIFY_DISABLED=${SUTURA_VERIFY_DISABLED:-}
+      # Sandbox step timeouts (ms). Defaults (180s install/test, 5m grader) are
+      # too tight for heavyweight toolchains -- a .NET SDK download + full
+      # solution restore/build needs several minutes in the install phase, and
+      # the grader repeats that install from a fresh workspace.
+      - SUTURA_INSTALL_TIMEOUT_MS=${SUTURA_INSTALL_TIMEOUT_MS:-600000}
+      - SUTURA_TEST_TIMEOUT_MS=${SUTURA_TEST_TIMEOUT_MS:-420000}
+      - SUTURA_GRADER_TIMEOUT_MS=${SUTURA_GRADER_TIMEOUT_MS:-900000}
+      # $HOME tmpfs size (MiB) and container memory cap (bytes). The .NET SDK
+      # (~700MB) plus the NuGet cache (>2GB for large solutions) live under
+      # $HOME; /work is a disk-backed volume and needs no sizing. tmpfs pages
+      # count against the memory cap, so it covers them (Docker VM is 8GB).
+      - SANDBOX_HOME_TMPFS_MB=${SANDBOX_HOME_TMPFS_MB:-4096}
+      - SUTURA_SANDBOX_MEMORY_BYTES=${SUTURA_SANDBOX_MEMORY_BYTES:-6442450944}
+      # --- Sandbox hardening (validated-fix worker) ---
+      # The worker talks to the least-privilege docker-socket-proxy instead of
+      # bind-mounting the host daemon socket. Both vars point dockerode/CLI at
+      # the proxy over TCP on the internal compose network.
+      - DOCKER_SOCKET_PROXY_URL=${DOCKER_SOCKET_PROXY_URL:-tcp://docker-socket-proxy:2375}
+      - DOCKER_HOST=${DOCKER_HOST:-tcp://docker-socket-proxy:2375}
+      # OCI runtime for sandbox containers. Compose/dev defaults to runc (no
+      # gVisor on a stock host); set to 'runsc' once gVisor is installed
+      # (scripts/setup-sandbox.sh). Production must use runsc.
+      - SANDBOX_RUNTIME=${SANDBOX_RUNTIME:-runc}
+      # No egress by default: sandbox containers run on an internal network with
+      # no route off-host. Install opts into egress only when this is 'true'.
+      - SANDBOX_ENABLE_EGRESS=${SANDBOX_ENABLE_EGRESS:-false}
+      - SANDBOX_EGRESS_NETWORK=${SANDBOX_EGRESS_NETWORK:-no-egress-net}
+      # When an outbound proxy is set, these hosts bypass it (the only route
+      # out); advisory without a proxy. Comma-separated.
+      - SANDBOX_EGRESS_ALLOWLIST=${SANDBOX_EGRESS_ALLOWLIST:-}
+      # Fail an attempt whose /work exceeds this many MiB before the offline
+      # build, so a runaway artifact can't fill the host disk. Empty = no ceiling.
+      - SANDBOX_WORK_DISK_CEILING_MB=${SANDBOX_WORK_DISK_CEILING_MB:-}
+      # --- Per-repo dependency-cache prewarm (B) ---
+      # Set to '1' to globally disable the prewarm/read-only-cache path (every
+      # attempt then runs the legacy per-attempt networked restore). Prewarm is
+      # also opt-in per org (settings_json.prewarmCache) and only applies to code
+      # fixes with a developer-taught toolchain.
+      - SUTURA_PREWARM_DISABLED=${SUTURA_PREWARM_DISABLED:-}
+      # Age (days) after which an unused dependency-cache volume is reclaimed at
+      # worker boot. 0 disables cache GC.
+      - SANDBOX_CACHE_TTL_DAYS=${SANDBOX_CACHE_TTL_DAYS:-14}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      docker-socket-proxy:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    restart: unless-stopped
+
+  docker-socket-proxy:
+    # Least-privilege gateway in front of the host Docker daemon. The backend
+    # talks to this proxy (DOCKER_HOST=tcp://docker-socket-proxy:2375) instead
+    # of bind-mounting /var/run/docker.sock, so a backend compromise cannot
+    # drive the full daemon API -- only the allow-listed endpoints below.
+    image: tecnativa/docker-socket-proxy:0.3.0
+    environment:
+      # Allow ONLY what the validated-fix pipeline needs.
+      CONTAINERS: 1   # create/start/stop/wait/remove sandbox containers
+      IMAGES: 1       # read/list base images
+      NETWORKS: 1     # create + attach the no-egress network
+      EXEC: 1         # exec into the workspace container
+      POST: 1         # POST is required for create/start/exec (off = read-only)
+      VOLUMES: 1      # per-repo dependency-cache volumes (prewarm create/list/inspect/remove + GC)
+      # Everything else stays at its deny-by-default. Explicitly pinned off so
+      # the intent is auditable.
+      SECRETS: 0
+      SWARM: 0
+      SERVICES: 0
+      CONFIGS: 0
+      NODES: 0
+      TASKS: 0
+      PLUGINS: 0
+      SYSTEM: 0
+      INFO: 0
+      AUTH: 0
+      BUILD: 0
+      COMMIT: 0
+      DISTRIBUTION: 0
+      SESSION: 0
+    volumes:
+      # Read-only mount of the host socket: the proxy reads it, the backend
+      # never sees it directly.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    healthcheck:
+      # The proxy exposes the Docker API; /_ping returns OK when allowed.
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:2375/_ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sutura
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: sutura
+    volumes:
+      # Schema is owned by the backend's migrate.ts (single source of truth).
+      # initdb migration mounts were removed to eliminate double-apply on boot.
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sutura -d sutura"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:

@@ -1,0 +1,56 @@
+# Sutura sandbox base -- shared layer for all language-specific images.
+# Includes the security scanners (osv-scanner, semgrep, pip-audit) plus git so
+# that DockerSandboxRunner can `git apply` patches inside the workspace.
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      git \
+      patch \
+      python3 \
+      python3-pip \
+      python3-venv \
+      jq \
+      tar \
+      xz-utils \
+ && rm -rf /var/lib/apt/lists/*
+
+# semgrep + pip-audit (system-wide; --break-system-packages required on bookworm).
+RUN pip3 install --break-system-packages --no-cache-dir \
+      semgrep \
+      pip-audit
+
+# osv-scanner (static binary).
+ARG OSV_VERSION=1.9.2
+RUN curl -fsSL -o /usr/local/bin/osv-scanner \
+      "https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/osv-scanner_linux_amd64" \
+ && chmod +x /usr/local/bin/osv-scanner
+
+# Aikido local-scan CLI. Required for `runSecurityScan` to use Aikido for the
+# rescan; if absent, the runner transparently falls back to npm-audit /
+# pip-audit / osv-scanner / semgrep. Set AIKIDO_CLI_INSTALL=skip at build time
+# to opt out (e.g., for CI environments without npm registry access).
+ARG AIKIDO_CLI_INSTALL=install
+RUN if [ "$AIKIDO_CLI_INSTALL" = "install" ]; then \
+      apt-get update \
+   && apt-get install -y --no-install-recommends nodejs npm \
+   && rm -rf /var/lib/apt/lists/* \
+   && (npm install -g @aikidosec/cli 2>/dev/null \
+        || npm install -g aikido-cli 2>/dev/null \
+        || echo "[sandbox] aikido CLI not installed; will fall back to OSS scanners"); \
+    fi
+
+# Init a git repo at /work on workspace startup so `git apply` always has an
+# index to apply against. The actual workspace contents are uploaded by the
+# runner via putArchive.
+WORKDIR /work
+RUN git config --global init.defaultBranch main \
+ && git config --global user.email "sutura-sandbox@sutura.local" \
+ && git config --global user.name "Sutura Sandbox" \
+ && git init -q .
+
+CMD ["sleep", "infinity"]

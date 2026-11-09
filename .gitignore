@@ -1,0 +1,27 @@
+node_modules/
+dist/
+.next/
+.env
+.env.*
+!.env.example
+!deploy/azure/.env.production.template
+*.log
+.DS_Store
+coverage/
+.turbo/
+.superpowers/
+.claude/worktrees/
+.playwright-mcp/
+
+# Local tooling, generated artifacts, and private material
+.claude/
+.codex/
+*.tsbuildinfo
+*.pem
+*.key
+*.p12
+*.pfx
+*.sqlite
+*.sqlite3
+*.db
+postgres-data-backup*.tar.gz

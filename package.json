@@ -1,0 +1,41 @@
+{
+  "name": "sutura",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "VulnFix Platform - Continuous vulnerability remediation system",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:dashboard": "npm run dev --workspace=apps/dashboard",
+    "dev:backend": "npm run dev --workspace=packages/backend",
+    "build": "npm run build --workspaces",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "build:check": "npm run build --workspace=apps/dashboard",
+    "check": "npm run lint && npm run format:check && npm run test && npm run build:check"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "author": "Victor Junqueira - Intelligentsia Lab",
+  "license": "MIT",
+  "devDependencies": {
+    "@eslint/js": "^9.39.4",
+    "@vitest/coverage-v8": "^4.1.12",
+    "eslint": "^9.39.4",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.8.1",
+    "typescript-eslint": "^8.58.1",
+    "vitest": "^4.1.12"
+  },
+  "overrides": {
+    "uuid": "^11.1.1"
+  }
+}

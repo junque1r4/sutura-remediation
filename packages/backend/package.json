@@ -1,0 +1,38 @@
+{
+  "name": "@sutura/backend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "vitest",
+    "lint": "eslint src/"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@octokit/auth-app": "^6.1.0",
+    "@octokit/rest": "^19.0.13",
+    "@pinecone-database/pinecone": "^4.0.0",
+    "@sutura/common": "*",
+    "@sutura/fix-engine": "*",
+    "@sutura/sandbox-runner": "*",
+    "@sutura/vector-indexer": "*",
+    "bullmq": "^6.5.0",
+    "cors": "^2.8.6",
+    "express": "^5.3.0",
+    "helmet": "^8.3.0",
+    "ioredis": "^6.0.0",
+    "pg": "^8.20.0",
+    "zod": "^4.6.6"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.20.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.12"
+  }
+}

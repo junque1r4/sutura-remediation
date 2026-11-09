@@ -1,0 +1,13 @@
+# The base image is passed explicitly (--build-arg BASE_IMAGE=...) and never
+# defaults to a mutable :latest tag, so a build can't silently pull an
+# unrelated public image. Local: the sutura/sandbox-base you just built;
+# CI: the same-commit ACR tag.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+RUN pip3 install --break-system-packages --no-cache-dir \
+      pytest \
+      pytest-cov
+
+WORKDIR /work
+CMD ["sleep", "infinity"]

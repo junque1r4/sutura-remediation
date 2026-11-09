@@ -1,0 +1,14 @@
+{
+  "name": "@sutura/common",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/index.ts",
+  "scripts": {
+    "build": "tsc",
+    "lint": "eslint src/"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "zod": "^4.6.6"
+  }
+}

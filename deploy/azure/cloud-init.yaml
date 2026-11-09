@@ -1,0 +1,86 @@
+#cloud-config
+# =============================================================================
+# Sutura VM host preparation (runs once at first boot).
+#
+# Prepares the host so a deploy can run; it does NOT deploy the app itself
+# (the CI deploy workflow / deploy.sh does that, shipping the compose files and
+# pulling secrets from Key Vault). This step:
+#   1. mounts the Premium SSD data disk at /var/lib/docker (before Docker starts)
+#   2. installs Docker Engine + compose plugin + Azure CLI + jq
+#   3. installs gVisor (runsc) and registers it with the Docker daemon
+#      (mirrors scripts/setup-sandbox.sh, inlined so no repo clone is needed)
+#   4. creates the internal no-egress network used by sandbox containers
+#   5. creates /opt/sutura for the deploy assets + rendered .env
+# =============================================================================
+package_update: true
+package_upgrade: false
+
+write_files:
+  - path: /opt/sutura/host-setup.sh
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      log() { printf '[host-setup] %s\n' "$*"; }
+
+      # --- 1. Mount the data disk at /var/lib/docker (before Docker installs) ---
+      DATA_DISK="/dev/disk/azure/scsi1/lun0"
+      log "Waiting for the data disk to appear"
+      for _ in $(seq 1 30); do [ -e "$DATA_DISK" ] && break; sleep 2; done
+      if ! blkid "$DATA_DISK" >/dev/null 2>&1; then
+        log "Formatting data disk ext4"
+        mkfs.ext4 -F "$DATA_DISK"
+      fi
+      mkdir -p /var/lib/docker
+      UUID="$(blkid -s UUID -o value "$DATA_DISK")"
+      if ! grep -q "$UUID" /etc/fstab; then
+        echo "UUID=$UUID /var/lib/docker ext4 defaults,nofail 0 2" >> /etc/fstab
+      fi
+      mount -a
+
+      # --- 2. Docker Engine + compose plugin ----------------------------------
+      export DEBIAN_FRONTEND=noninteractive
+      install -m 0755 -d /etc/apt/keyrings
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+        | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+      chmod a+r /etc/apt/keyrings/docker.gpg
+      . /etc/os-release
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" \
+        > /etc/apt/sources.list.d/docker.list
+      apt-get update -y
+      apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin jq
+      systemctl enable --now docker
+
+      # --- 3. Azure CLI -------------------------------------------------------
+      curl -sL https://aka.ms/InstallAzureCLIDeb | bash
+
+      # --- 4. gVisor (runsc) -- mirrors scripts/setup-sandbox.sh --------------
+      if ! docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"runsc"'; then
+        log "Installing gVisor (runsc)"
+        ARCH="$(uname -m)"
+        URL="https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH}"
+        TMP="$(mktemp -d)"
+        (
+          cd "$TMP"
+          wget --quiet "${URL}/runsc" "${URL}/runsc.sha512" \
+            "${URL}/containerd-shim-runsc-v1" "${URL}/containerd-shim-runsc-v1.sha512"
+          sha512sum -c runsc.sha512 -c containerd-shim-runsc-v1.sha512
+          chmod a+rx runsc containerd-shim-runsc-v1
+          mv runsc containerd-shim-runsc-v1 /usr/local/bin
+        )
+        rm -rf "$TMP"
+        runsc install
+        systemctl restart docker
+      fi
+
+      # --- 5. Internal no-egress network --------------------------------------
+      if ! docker network inspect no-egress-net >/dev/null 2>&1; then
+        docker network create --driver bridge --internal \
+          --label sutura.sandbox=1 no-egress-net
+      fi
+
+      log "Host ready. Deploy with deploy/azure/deploy.sh (via CI or manually)."
+
+runcmd:
+  - [ bash, -lc, "/opt/sutura/host-setup.sh 2>&1 | tee /var/log/sutura-host-setup.log" ]

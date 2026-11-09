@@ -1,0 +1,24 @@
+# Sutura reverse proxy -- automatic HTTPS via Let's Encrypt.
+#
+# Two public hostnames (both must resolve to the VM's public IP):
+#   {$APP_DOMAIN}  -> dashboard (Next.js, :3000)
+#   {$API_DOMAIN}  -> backend  (:3001)  -- this is the browser-reachable origin
+#                                          baked into the dashboard as
+#                                          NEXT_PUBLIC_BACKEND_URL at build time.
+#
+# Caddy obtains and renews certs automatically on first request; certs persist
+# in the caddy-data volume. {$VAR} values come from the compose environment.
+
+{
+	email {$ACME_EMAIL}
+}
+
+{$APP_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy dashboard:3000
+}
+
+{$API_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy backend:3001
+}
